@@ -431,10 +431,46 @@ class FusionEngine:
 
     def execute_delta_merge(self, job_id: int, delta_records: list[dict[str, Any]],
                             watermark_record_id: int = 0) -> dict[str, Any]:
-        """执行增量归并：将增量数据合并到融合作业的输出中。"""
+        """执行增量归并：将增量数据合并到融合作业的输出中。
+
+        来源归属校验：每条增量记录的 ``_source`` 必须是作业参与来源，否则整批
+        拒绝，不写作业明细也不动任何来源进度；水位记录同样必须归属作业来源。
+        进度写入权限：水位只推进到本批实际归并记录的最大事件时间，尚未得到
+        归并结果的输入不会被进度承认，避免下一次领用入口丢失未确认数据。
+        """
         job = self._fusion_jobs.get(job_id)
         if job is None:
             return {"ok": False, "message": f"融合作业 {job_id} 不存在"}
+
+        foreign_sources = sorted({
+            str(record.get("_source", ""))
+            for record in delta_records
+            if record.get("_source") not in job.participant_sources
+        })
+        if foreign_sources:
+            return {
+                "ok": False,
+                "message": (
+                    f"来源 {'、'.join(foreign_sources)} 不属于作业 {job.job_code} 的"
+                    f"参与来源（{'、'.join(job.participant_sources)}），整批拒绝归并"
+                ),
+                "foreign_sources": foreign_sources,
+                "inserted": 0,
+                "updated": 0,
+                "deleted": 0,
+            }
+
+        wm = self._watermarks.get(watermark_record_id) if watermark_record_id > 0 else None
+        if watermark_record_id > 0 and wm is None:
+            return {"ok": False, "message": f"水位记录 {watermark_record_id} 不存在"}
+        if wm is not None and wm.data_source not in job.participant_sources:
+            return {
+                "ok": False,
+                "message": (
+                    f"水位记录归属来源 {wm.data_source}，不属于作业 {job.job_code} 的"
+                    f"参与来源，禁止由本作业推进该来源进度"
+                ),
+            }
 
         existing = {self._make_merge_key(r, job.join_key): r for r in job.merged_records}
         inserted = 0
@@ -457,18 +493,34 @@ class FusionEngine:
 
         job.merged_records = list(existing.values())
 
-        if watermark_record_id > 0:
-            wm = self._watermarks.get(watermark_record_id)
-            if wm is not None:
+        watermark_receipt: dict[str, Any] | None = None
+        if wm is not None:
+            # 只承认实际归并成功的这一段：取本批记录携带的最大事件时间。
+            batch_ceiling = max(
+                (str(record.get("_timestamp", "")) for record in delta_records),
+                default="",
+            )
+            if batch_ceiling and batch_ceiling > wm.current_watermark:
                 wm.previous_watermark = wm.current_watermark
-                wm.current_watermark = _now_iso()
+                wm.current_watermark = batch_ceiling
+                wm.last_advance = _now_iso()
+            watermark_receipt = {
+                "record_code": wm.record_code,
+                "data_source": wm.data_source,
+                "job_code": job.job_code,
+                "previous_watermark": wm.previous_watermark,
+                "current_watermark": wm.current_watermark,
+                "advanced_to": wm.current_watermark if batch_ceiling else "",
+            }
 
         return {
             "ok": True,
+            "job_code": job.job_code,
             "inserted": inserted,
             "updated": updated,
             "deleted": deleted,
             "total_after_merge": len(job.merged_records),
+            "watermark": watermark_receipt,
         }
 
     def execute_backfill_with_checkpoint(self, backfill_id: int,
